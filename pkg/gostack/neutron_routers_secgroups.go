@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -80,12 +81,63 @@ func enrichSecGroupRule(ru map[string]interface{}, projectID string) {
 	setDefault(ru, "protocol", nil)
 	setDefault(ru, "port_range_min", nil)
 	setDefault(ru, "port_range_max", nil)
-	setDefault(ru, "ether_type", "IPv4")
+	// The Neutron API field is "ethertype" (openstacksdk sends that); keep the
+	// legacy "ether_type" key in sync with it instead of defaulting it blindly.
+	setDefault(ru, "ethertype", ru["ether_type"])
+	if ru["ethertype"] == nil {
+		ru["ethertype"] = "IPv4"
+	}
+	ru["ether_type"] = ru["ethertype"]
 	setDefault(ru, "direction", "ingress")
 	if projectID != "" {
 		setDefault(ru, "project_id", projectID)
 		setDefault(ru, "tenant_id", ru["project_id"])
 	}
+}
+
+// secGroupRulesFor returns the rules belonging to a security group.
+func secGroupRulesFor(sgID interface{}) []map[string]interface{} {
+	rules := []map[string]interface{}{}
+	for _, ru := range neutronSecGroupRules {
+		if ru["security_group_id"] == sgID {
+			rules = append(rules, ru)
+		}
+	}
+	return rules
+}
+
+// secGroupRuleKeyFields are the attributes Neutron compares to decide whether
+// a new security group rule duplicates an existing one.
+var secGroupRuleKeyFields = []string{
+	"security_group_id", "direction", "ethertype", "protocol",
+	"port_range_min", "port_range_max",
+	"remote_ip_prefix", "remote_group_id", "remote_address_group_id",
+}
+
+func secGroupRuleKey(ru map[string]interface{}) string {
+	var b strings.Builder
+	for _, f := range secGroupRuleKeyFields {
+		v := ru[f]
+		if v == nil {
+			v = ""
+		}
+		if s, ok := v.(string); ok && f == "protocol" {
+			v = strings.ToLower(s)
+		}
+		fmt.Fprintf(&b, "%s=%v;", f, v)
+	}
+	return b.String()
+}
+
+// findDuplicateSecGroupRule returns an existing rule identical to ru, or nil.
+func findDuplicateSecGroupRule(ru map[string]interface{}) map[string]interface{} {
+	key := secGroupRuleKey(ru)
+	for _, existing := range neutronSecGroupRules {
+		if secGroupRuleKey(existing) == key {
+			return existing
+		}
+	}
+	return nil
 }
 
 func registerNeutronRouters(mux *http.ServeMux) {
@@ -301,6 +353,9 @@ func registerNeutronSecurityGroups(mux *http.ServeMux) {
 						continue
 					}
 				}
+				// Like Neutron, embed each group's rules in the list response
+				// too (clients such as os-migrate read them from here).
+				sg["security_group_rules"] = secGroupRulesFor(sg["id"])
 				filtered = append(filtered, sg)
 			}
 			writeJSON(w, map[string]interface{}{"security_groups": filtered})
@@ -349,13 +404,7 @@ func registerNeutronSecurityGroups(mux *http.ServeMux) {
 			return
 		}
 		// Attach current rules for a single-group fetch.
-		rules := []map[string]interface{}{}
-		for _, ru := range neutronSecGroupRules {
-			if ru["security_group_id"] == id {
-				rules = append(rules, ru)
-			}
-		}
-		sg["security_group_rules"] = rules
+		sg["security_group_rules"] = secGroupRulesFor(id)
 
 		switch r.Method {
 		case http.MethodGet:
@@ -409,9 +458,21 @@ func registerNeutronSecurityGroups(mux *http.ServeMux) {
 				return
 			}
 			ru := req.SecurityGroupRule
+			enrichSecGroupRule(ru, projectID)
+			// Neutron rejects a rule identical to an existing one with a 409
+			// (SecurityGroupRuleExists); os-migrate relies on that to make
+			// rule imports idempotent.
+			if dup := findDuplicateSecGroupRule(ru); dup != nil {
+				w.WriteHeader(http.StatusConflict)
+				writeJSON(w, map[string]interface{}{"NeutronError": map[string]interface{}{
+					"type":    "SecurityGroupRuleExists",
+					"message": fmt.Sprintf("Security group rule already exists. Rule id is %v.", dup["id"]),
+					"detail":  "",
+				}})
+				return
+			}
 			secGroupRuleSeq++
 			ru["id"] = fmt.Sprintf("sgr-%d", secGroupRuleSeq)
-			enrichSecGroupRule(ru, projectID)
 			neutronSecGroupRules = append(neutronSecGroupRules, ru)
 			w.WriteHeader(http.StatusCreated)
 			writeJSON(w, map[string]interface{}{"security_group_rule": ru})
