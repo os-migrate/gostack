@@ -33,6 +33,14 @@ type Options struct {
 	PIDFile string
 	// BaseURL is the base URL for catalog/links (e.g. "http://127.0.0.1:5000").
 	BaseURL string
+	// RequireAuth answers requests without a valid X-Auth-Token with a
+	// 401, as the real services do. nil follows the seed profile: the
+	// devstack profile requires a token, the default one does not, so
+	// existing callers keep working.
+	RequireAuth *bool
+	// SeedProfile selects the sample resources the cloud starts with:
+	// SeedOSMigrate (the default) or SeedDevstack.
+	SeedProfile string
 }
 
 // DefaultOptions returns default server options.
@@ -76,20 +84,24 @@ func NewFakeServer(opts Options) *FakeServer {
 
 	SetBaseURL(opts.BaseURL)
 
+	if opts.SeedProfile != "" {
+		ApplySeedProfile(opts.SeedProfile)
+	}
+
 	pid := os.Getpid()
 	if err := os.WriteFile(opts.PIDFile, []byte(fmt.Sprintf("%d", pid)), 0644); err != nil {
 		log.Fatalf("Failed to write PID file: %v", err)
 	}
 
-	roleAssignments := map[string]map[string][]string{}
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		log.Printf("%s %s", r.Method, r.URL.Path)
-		http.NotFound(w, r)
+		log.Printf("unrouted %s %s", r.Method, r.URL.Path)
+		notFound(w, serviceForPath(r.URL.Path), "The resource")
 	})
 
-	RegisterKeystoneHandlers(mux, roleAssignments)
+	RegisterKeystoneHandlers(mux)
+	RegisterKeystoneExtraHandlers(mux)
 	RegisterNovaHandlers(mux)
 	RegisterNeutronHandlers(mux)
 	RegisterCinderHandlers(mux)
@@ -98,9 +110,21 @@ func NewFakeServer(opts Options) *FakeServer {
 	addr := fmt.Sprintf("%s:%d", opts.BindAddr, opts.Port)
 	fs := &FakeServer{URL: "http://" + addr, PIDFile: opts.PIDFile}
 
+	requireAuth := opts.SeedProfile == SeedDevstack
+	if opts.RequireAuth != nil {
+		requireAuth = *opts.RequireAuth
+	}
+
+	var handler http.Handler = mux
+	handler = Microversion(handler)
+	if requireAuth {
+		handler = RequireToken(handler)
+	}
+	handler = Recover(NormalizeV2Path(handler))
+
 	go func() {
 		log.Printf("Fake OpenStack API listening on %s", addr)
-		err := http.ListenAndServe(addr, Recover(NormalizeV2Path(mux)))
+		err := http.ListenAndServe(addr, handler)
 		if err != nil {
 			log.Fatalf("Server failed: %v", err)
 		}
